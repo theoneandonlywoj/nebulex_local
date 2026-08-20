@@ -250,7 +250,7 @@ defmodule Nebulex.Adapters.Local do
   However, there are some predefined or shorthand queries you can use. See the
   ["Predefined queries"](#module-predefined-queries) section for information.
 
-  The adapter defines an entry as a tuple `{:entry, key, value, touched, ttl, tag}`,
+  The adapter defines an entry as a tuple `{:entry, key, value, touched, exp, tag}`,
   meaning the match pattern within the ETS Match Spec must be like
   `{:entry, :"$1", :"$2", :"$3", :"$4", :"$5"}`. To make query building easier,
   you can use the `Ex2ms` library.
@@ -275,6 +275,20 @@ defmodule Nebulex.Adapters.Local do
       {:ok, [{:b, 2}, {:c, 3}]}
 
   > You can use the `Ex2ms` or `MatchSpec` library to build queries easier.
+
+  ### `{:in, keys}` queries
+
+  Queries with `{:in, keys}` (e.g., `MyCache.get_all(in: keys)`) are executed
+  as key-indexed operations, one per key, so their cost is proportional to the
+  number of given keys (`O(keys)`) regardless of the cache size. Duplicated
+  keys in the list are processed only once. Bear in mind:
+
+    * `get_all` behaves like `fetch/2` on each key: if an entry is found in
+      the older generation, it is moved into the newer one, and expired
+      entries are lazily removed on read.
+    * `count_all` and `delete_all` neither count nor delete expired entries.
+    * `stream` is read-only; it does not move entries across generations nor
+      remove expired ones.
 
   ## Building Match Specs with QueryHelper
 
@@ -898,9 +912,6 @@ defmodule Nebulex.Adapters.Local do
     # Resolve the backend to be used
     backend = Keyword.fetch!(opts, :backend)
 
-    # Internal option for max nested match specs based on number of keys
-    purge_chunk_size = Keyword.fetch!(opts, :purge_chunk_size)
-
     # Build adapter metadata
     adapter_meta = %{
       name: opts[:name] || cache,
@@ -909,7 +920,6 @@ defmodule Nebulex.Adapters.Local do
       meta_tab: meta_tab,
       stats_counter: stats_counter,
       backend: backend,
-      purge_chunk_size: purge_chunk_size,
       started_at: DateTime.utc_now()
     }
 
@@ -1008,7 +1018,6 @@ defmodule Nebulex.Adapters.Local do
         on_write,
         adapter_meta.meta_tab,
         adapter_meta.backend,
-        adapter_meta.purge_chunk_size,
         Enum.map(
           entries,
           &entry(key: elem(&1, 0), value: elem(&1, 1), touched: now, exp: exp, tag: tag)
@@ -1018,12 +1027,12 @@ defmodule Nebulex.Adapters.Local do
     end)
   end
 
-  defp do_put_all(:put, meta_tab, backend, chunk_size, entries) do
-    put_entries(meta_tab, backend, entries, chunk_size)
+  defp do_put_all(:put, meta_tab, backend, entries) do
+    put_entries(meta_tab, backend, entries)
   end
 
-  defp do_put_all(:put_new, meta_tab, backend, chunk_size, entries) do
-    put_new_entries(meta_tab, backend, entries, chunk_size)
+  defp do_put_all(:put_new, meta_tab, backend, entries) do
+    put_new_entries(meta_tab, backend, entries)
   end
 
   @impl true
@@ -1179,16 +1188,18 @@ defmodule Nebulex.Adapters.Local do
   defp do_execute(
          %{meta_tab: meta_tab, backend: backend},
          %{op: :count_all, query: {:in, keys}},
-         opts
+         _opts
        )
        when is_list(keys) do
-    chunk_size = Keyword.get(opts, :chunk_size, 10)
+    keys = Enum.uniq(keys)
 
     with_retry(fn ->
+      now = Time.now()
+
       meta_tab
       |> list_gen()
       |> Enum.reduce(0, fn gen, acc ->
-        do_count_all(backend, gen, keys, chunk_size) + acc
+        do_count_all(backend, gen, keys, now) + acc
       end)
       |> wrap_ok()
     end)
@@ -1197,34 +1208,39 @@ defmodule Nebulex.Adapters.Local do
   defp do_execute(
          %{meta_tab: meta_tab, backend: backend},
          %{op: :delete_all, query: {:in, keys}},
-         opts
+         _opts
        )
        when is_list(keys) do
-    chunk_size = Keyword.get(opts, :chunk_size, 10)
+    keys = Enum.uniq(keys)
 
     with_retry(fn ->
+      now = Time.now()
+
       meta_tab
       |> list_gen()
       |> Enum.reduce(0, fn gen, acc ->
-        do_delete_all(backend, gen, keys, chunk_size) + acc
+        do_delete_all(backend, gen, keys, now) + acc
       end)
       |> wrap_ok()
     end)
   end
 
   defp do_execute(
-         %{meta_tab: meta_tab, backend: backend},
+         %{name: name, meta_tab: meta_tab, backend: backend},
          %{op: :get_all, query: {:in, keys}, select: select},
-         opts
+         _opts
        )
        when is_list(keys) do
-    chunk_size = Keyword.get(opts, :chunk_size, 10)
+    keys = Enum.uniq(keys)
 
     with_retry(fn ->
-      meta_tab
-      |> list_gen()
-      |> Enum.reduce([], fn gen, acc ->
-        do_get_all(backend, gen, keys, match_return(select), chunk_size) ++ acc
+      generations = list_gen(meta_tab)
+
+      keys
+      |> Enum.flat_map(fn key ->
+        generations
+        |> do_fetch(name, backend, key)
+        |> select_entries(select)
       end)
       |> wrap_ok()
     end)
@@ -1266,13 +1282,9 @@ defmodule Nebulex.Adapters.Local do
          opts
        ) do
     keys
+    |> Stream.uniq()
     |> Stream.chunk_every(Keyword.fetch!(opts, :max_entries))
-    |> Stream.map(fn chunk ->
-      meta_tab
-      |> list_gen()
-      |> Enum.reduce([], &(backend.select(&1, in_match_spec(chunk, select)) ++ &2))
-    end)
-    |> Stream.flat_map(& &1)
+    |> Stream.flat_map(&select_keys(meta_tab, backend, &1, select))
     |> wrap_ok()
   end
 
@@ -1309,6 +1321,17 @@ defmodule Nebulex.Adapters.Local do
       end,
       & &1
     )
+  end
+
+  defp select_keys(meta_tab, backend, keys, select) do
+    now = Time.now()
+    generations = list_gen(meta_tab)
+
+    Enum.flat_map(keys, fn key ->
+      ms = key_match_spec(key, select, now)
+
+      Enum.flat_map(generations, &backend.select(&1, ms))
+    end)
   end
 
   ## Nebulex.Adapter.Info
@@ -1407,9 +1430,7 @@ defmodule Nebulex.Adapters.Local do
       fetch_entry: 4,
       pop_entry: 4,
       list_gen: 1,
-      newer_gen: 1,
-      entry_keys: 1,
-      match_key: 2
+      newer_gen: 1
     ]
   ]
 
@@ -1478,10 +1499,6 @@ defmodule Nebulex.Adapters.Local do
     |> hd()
   end
 
-  defp entry_keys(entries) do
-    Enum.map(entries, fn entry(key: key) -> key end)
-  end
-
   defp validate_exp(entry(key: key, exp: exp) = entry, backend, tab, name) do
     if Time.now() >= exp do
       true = backend.delete(tab, key)
@@ -1526,12 +1543,8 @@ defmodule Nebulex.Adapters.Local do
     end
   end
 
-  defp put_entries(meta_tab, backend, entries, chunk_size) when is_list(entries) do
-    do_put_entries(meta_tab, backend, entries, fn older_gen ->
-      keys = Enum.map(entries, fn entry(key: key) -> key end)
-
-      do_delete_all(backend, older_gen, keys, chunk_size)
-    end)
+  defp put_entries(meta_tab, backend, entries) when is_list(entries) do
+    do_put_entries(meta_tab, backend, entries, &purge_older_gen(backend, &1, entries))
   end
 
   defp do_put_entries(meta_tab, backend, entry_or_entries, purge_fun) do
@@ -1546,9 +1559,7 @@ defmodule Nebulex.Adapters.Local do
     end
   end
 
-  defp put_new_entries(meta_tab, backend, entries, chunk_size \\ 0)
-
-  defp put_new_entries(meta_tab, backend, entry(key: key) = entry, _chunk_size) do
+  defp put_new_entries(meta_tab, backend, entry(key: key) = entry) do
     do_put_new_entries(meta_tab, backend, entry, fn newer_gen, older_gen ->
       with true <- backend.insert_new(older_gen, entry) do
         true = backend.delete(older_gen, key)
@@ -1558,16 +1569,19 @@ defmodule Nebulex.Adapters.Local do
     end)
   end
 
-  defp put_new_entries(meta_tab, backend, entries, chunk_size) when is_list(entries) do
+  defp put_new_entries(meta_tab, backend, entries) when is_list(entries) do
     do_put_new_entries(meta_tab, backend, entries, fn newer_gen, older_gen ->
       with true <- backend.insert_new(older_gen, entries) do
-        keys = entry_keys(entries)
-
-        _ = do_delete_all(backend, older_gen, keys, chunk_size)
+        :ok = purge_older_gen(backend, older_gen, entries)
 
         backend.insert_new(newer_gen, entries)
       end
     end)
+  end
+
+  # Removes the given entries' keys from the older generation.
+  defp purge_older_gen(backend, older_gen, entries) do
+    Enum.each(entries, fn entry(key: key) -> backend.delete(older_gen, key) end)
   end
 
   defp do_put_new_entries(meta_tab, backend, entry_or_entries, purge_fun) do
@@ -1607,118 +1621,16 @@ defmodule Nebulex.Adapters.Local do
     end)
   end
 
-  defp do_count_all(backend, tab, keys, chunk_size) do
-    ets_select_keys(
-      keys,
-      chunk_size,
-      0,
-      &new_match_spec/1,
-      &backend.select_count(tab, &1),
-      &(&1 + &2)
-    )
+  defp do_count_all(backend, tab, keys, now) do
+    Enum.reduce(keys, 0, fn key, acc ->
+      backend.select_count(tab, key_match_spec(key, now)) + acc
+    end)
   end
 
-  defp do_delete_all(backend, tab, keys, chunk_size) do
-    ets_select_keys(
-      keys,
-      chunk_size,
-      0,
-      &new_match_spec/1,
-      &backend.select_delete(tab, &1),
-      &(&1 + &2)
-    )
-  end
-
-  defp do_get_all(backend, tab, keys, select, chunk_size) do
-    ets_select_keys(
-      keys,
-      chunk_size,
-      [],
-      &new_match_spec(&1, select),
-      &backend.select(tab, &1),
-      &Kernel.++/2
-    )
-  end
-
-  defp ets_select_keys([k], chunk_size, acc, ms_fun, chunk_fun, after_fun) do
-    k = if is_tuple(k), do: tuple_to_match_spec(k), else: k
-
-    ets_select_keys(
-      [],
-      2,
-      chunk_size,
-      match_key(k, Time.now()),
-      acc,
-      ms_fun,
-      chunk_fun,
-      after_fun
-    )
-  end
-
-  defp ets_select_keys([k1, k2 | keys], chunk_size, acc, ms_fun, chunk_fun, after_fun) do
-    k1 = if is_tuple(k1), do: tuple_to_match_spec(k1), else: k1
-    k2 = if is_tuple(k2), do: tuple_to_match_spec(k2), else: k2
-    now = Time.now()
-
-    ets_select_keys(
-      keys,
-      2,
-      chunk_size,
-      {:orelse, match_key(k1, now), match_key(k2, now)},
-      acc,
-      ms_fun,
-      chunk_fun,
-      after_fun
-    )
-  end
-
-  defp ets_select_keys([], _count, _chunk_size, chunk_acc, acc, ms_fun, chunk_fun, after_fun) do
-    chunk_acc
-    |> ms_fun.()
-    |> chunk_fun.()
-    |> after_fun.(acc)
-  end
-
-  defp ets_select_keys(keys, count, chunk_size, chunk_acc, acc, ms_fun, chunk_fun, after_fun)
-       when count >= chunk_size do
-    acc =
-      chunk_acc
-      |> ms_fun.()
-      |> chunk_fun.()
-      |> after_fun.(acc)
-
-    ets_select_keys(keys, chunk_size, acc, ms_fun, chunk_fun, after_fun)
-  end
-
-  defp ets_select_keys([k | keys], count, chunk_size, chunk_acc, acc, ms_fun, chunk_fun, after_fun) do
-    k = if is_tuple(k), do: tuple_to_match_spec(k), else: k
-
-    ets_select_keys(
-      keys,
-      count + 1,
-      chunk_size,
-      {:orelse, chunk_acc, match_key(k, Time.now())},
-      acc,
-      ms_fun,
-      chunk_fun,
-      after_fun
-    )
-  end
-
-  defp tuple_to_match_spec(data) do
-    data
-    |> :erlang.tuple_to_list()
-    |> tuple_to_match_spec([])
-  end
-
-  defp tuple_to_match_spec([], acc) do
-    {acc |> Enum.reverse() |> :erlang.list_to_tuple()}
-  end
-
-  defp tuple_to_match_spec([e | tail], acc) do
-    e = if is_tuple(e), do: tuple_to_match_spec(e), else: e
-
-    tuple_to_match_spec(tail, [e | acc])
+  defp do_delete_all(backend, tab, keys, now) do
+    Enum.reduce(keys, 0, fn key, acc ->
+      backend.select_delete(tab, key_match_spec(key, now)) + acc
+    end)
   end
 
   defp return({:ok, entry(value: value)}, :value) do
@@ -1732,6 +1644,22 @@ defmodule Nebulex.Adapters.Local do
   defp return(other, _field) do
     other
   end
+
+  defp select_entries({:ok, entries}, select) when is_list(entries) do
+    for entry(key: key, value: value) <- entries, do: entry_return(select, key, value)
+  end
+
+  defp select_entries({:ok, entry(key: key, value: value)}, select) do
+    [entry_return(select, key, value)]
+  end
+
+  defp select_entries({:error, _}, _select) do
+    []
+  end
+
+  defp entry_return(:key, key, _value), do: key
+  defp entry_return(:value, _key, value), do: value
+  defp entry_return({:key, :value}, key, value), do: {key, value}
 
   defp assert_match_spec(spec, select) when spec in [nil, :expired] do
     [
@@ -1765,7 +1693,7 @@ defmodule Nebulex.Adapters.Local do
   end
 
   defp comp_match_spec(nil) do
-    {:orelse, {:"=:=", :"$4", :infinity}, {:<, Time.now(), :"$4"}}
+    not_expired(Time.now())
   end
 
   defp comp_match_spec(:expired) do
@@ -1781,32 +1709,6 @@ defmodule Nebulex.Adapters.Local do
     match_spec
   end
 
-  defp in_match_spec([k], select) do
-    match_key(k, Time.now())
-    |> new_match_spec(match_return(select))
-  end
-
-  defp in_match_spec([k1, k2 | keys], select) do
-    now = Time.now()
-
-    keys
-    |> Enum.reduce(
-      {:orelse, match_key(k1, now), match_key(k2, now)},
-      &{:orelse, &2, match_key(&1, now)}
-    )
-    |> new_match_spec(match_return(select))
-  end
-
-  defp new_match_spec(conds, return \\ true) do
-    [
-      {
-        entry(key: :"$1", value: :"$2", touched: :"$3", exp: :"$4"),
-        [conds],
-        [return]
-      }
-    ]
-  end
-
   defp match_return(select) do
     case select do
       :key -> :"$1"
@@ -1815,8 +1717,84 @@ defmodule Nebulex.Adapters.Local do
     end
   end
 
-  defp match_key(k, now) do
-    {:andalso, {:"=:=", :"$1", k}, {:orelse, {:"=:=", :"$4", :infinity}, {:<, now, :"$4"}}}
+  # Match spec helpers for `{:in, keys}` queries. The key is bound directly
+  # in the match head so ETS can use the key index; a guard-only key
+  # comparison would force a full table scan.
+  defp key_match_spec(key, now) do
+    if safe_match_head_key?(key) do
+      [
+        {
+          entry(key: key, value: :_, touched: :_, exp: :"$4", tag: :_),
+          [not_expired(now)],
+          [true]
+        }
+      ]
+    else
+      [
+        {
+          entry(key: :"$1", value: :_, touched: :_, exp: :"$4", tag: :_),
+          [{:"=:=", :"$1", {:const, key}}, not_expired(now)],
+          [true]
+        }
+      ]
+    end
+  end
+
+  defp key_match_spec(key, select, now) do
+    if safe_match_head_key?(key) do
+      return =
+        case select do
+          :key -> {:const, key}
+          :value -> :"$2"
+          {:key, :value} -> {{{:const, key}, :"$2"}}
+        end
+
+      [
+        {
+          entry(key: key, value: :"$2", touched: :_, exp: :"$4", tag: :_),
+          [not_expired(now)],
+          [return]
+        }
+      ]
+    else
+      [
+        {
+          entry(key: :"$1", value: :"$2", touched: :_, exp: :"$4", tag: :_),
+          [{:"=:=", :"$1", {:const, key}}, not_expired(now)],
+          [match_return(select)]
+        }
+      ]
+    end
+  end
+
+  defp not_expired(now) do
+    {:orelse, {:"=:=", :"$4", :infinity}, {:<, now, :"$4"}}
+  end
+
+  # ETS treats the atom `:_` as a wildcard and `:"$N"` atoms as match
+  # variables when they appear in a match head, and map patterns match
+  # partially. Keys containing any of those terms fall back to an exact
+  # (but unindexed) `{:const, key}` guard comparison.
+  defp safe_match_head_key?(key) when is_atom(key) do
+    key != :_ and not match?("$" <> _, Atom.to_string(key))
+  end
+
+  defp safe_match_head_key?(key) when is_tuple(key) do
+    key
+    |> Tuple.to_list()
+    |> Enum.all?(&safe_match_head_key?/1)
+  end
+
+  defp safe_match_head_key?([h | t]) do
+    safe_match_head_key?(h) and safe_match_head_key?(t)
+  end
+
+  defp safe_match_head_key?(key) when is_map(key) do
+    false
+  end
+
+  defp safe_match_head_key?(_key) do
+    true
   end
 
   defp test_ms, do: entry(key: 1, value: 1, touched: Time.now(), exp: 1000)
