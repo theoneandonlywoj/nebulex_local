@@ -1,28 +1,28 @@
-## Local Scope First (`nebulex_local`)
+## nebulex_local — Project Context
 
-This repository is `nebulex_local` (the local adapter), not Nebulex core.
-When imported Nebulex sections mention `usage-rules/*.md` paths or core files,
-map them to this repository context first.
+This is the `nebulex_local` package, part of the
+[elixir-nebulex](https://github.com/elixir-nebulex) organization.
 
-### Local Rule Precedence (for this repo)
+Read `usage-rules/architecture.md` first — it covers why this package
+exists, how generational caching works, the module structure, implemented
+behaviours, and non-negotiable contribution rules.
 
-1. This local preface.
+### Running Tests
+
+```bash
+# With local nebulex core checkout (recommended during development)
+NEBULEX_PATH=~/path/to/nebulex mix test
+
+# Against published nebulex package
+mix test
+```
+
+### Local Rule Precedence
+
+1. This preface.
 2. `nebulex:workflow` section in this file.
 3. `nebulex:nebulex` section in this file (as framework guidance).
 4. `nebulex:elixir-style` and `nebulex:elixir` sections in this file.
-
-### Local Key Files
-
-- `lib/nebulex/adapters/local.ex` - Local adapter implementation.
-- `lib/nebulex/locks.ex` - Local lock/transaction coordination.
-- `lib/nebulex/adapters/local/options.ex` - Adapter option definitions/docs.
-- `test/nebulex/adapters/local_ets_test.exs` - Default ETS adapter tests.
-- `test/nebulex/adapters/local_shards_test.exs` - Shards adapter tests.
-- `test/nebulex/adapters/local/` - Generation, info, and query tests.
-- `test/nebulex/locks_test.exs` - Locking and retry behavior tests.
-- `test/shared/local_test_case.exs` - Shared test case for the adapter.
-- `README.md` - Public usage/configuration for this adapter.
-- `CHANGELOG.md` - Adapter release history.
 
 <!-- usage-rules-start -->
 <!-- nebulex:workflow-start -->
@@ -61,13 +61,15 @@ At the start of each session, quickly establish context:
 2. Run `git log --oneline -20` to see recent changes.
 3. Run `git branch -a` to see active branches and current branch.
 4. Read `README.md` and the latest section of `CHANGELOG.md`.
-5. Check `.tool-versions` or the `elixir` version in `mix.exs` for
+5. Read `usage-rules/architecture.md` for project architecture,
+   layer boundaries, and non-negotiable contribution rules.
+6. Check `.tool-versions` or the `elixir` version in `mix.exs` for
    supported Elixir/OTP versions.
 
 If on a feature branch, also run:
 
-6. `git log --oneline main..HEAD` to see the branch's commits.
-7. `git diff main...HEAD` to understand the branch's full scope.
+7. `git log --oneline main..HEAD` to see the branch's commits.
+8. `git diff main...HEAD` to understand the branch's full scope.
 
 When relevant to the task:
 
@@ -188,7 +190,11 @@ provides:
 - Event streaming via `Nebulex.Streams` for distributed invalidation.
 - Support for TTL, eviction policies, transactions, and more.
 
-## Key Files
+## Architecture & Key Files
+
+> Read `usage-rules/architecture.md` for full architecture context,
+> module hierarchy, layer boundaries, and non-negotiable contribution rules.
+> The section below is a quick-reference complement to that guide.
 
 | Path | Purpose |
 |------|---------|
@@ -204,9 +210,8 @@ provides:
 | `mix.exs` | Dependencies and project config |
 | `CHANGELOG.md` | Release history and breaking changes |
 | `test/` | Test suite (mirrors `lib/` structure) |
+| `usage-rules/architecture.md` | Architecture, non-negotiables, source of truth hierarchy |
 | `guides/` | User-facing guides, behavioral references, and examples |
-| `guides/introduction/` | Getting started, available adapters |
-| `guides/learning/` | Declarative caching, cache patterns, adapter creation, info API |
 | `guides/upgrading/v3.0.md` | v3 migration guide |
 
 ## Package Structure (v3)
@@ -1858,7 +1863,7 @@ mix usage_rules.docs Enum.zip/1
 
 ## Searching Documentation
 
-You should also consult the documentation of any tools you are using, early and often. The best
+You should also consult the documentation of any tools you are using, early and often. The best 
 way to accomplish this is to use the `usage_rules.search_docs` mix task. Once you have
 found what you are looking for, use the links in the search results to get more detail. For example:
 
