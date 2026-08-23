@@ -35,7 +35,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   than the one entry for that key. Keys are now bound directly in the match
   head, or compared as literal `{:const, key}` terms when that isn't
   possible (e.g. `:_`, `:"$N"` atoms, maps, structs), so reserved-looking
-  keys are always matched as literal values.
+  keys are always matched as literal values. `count_all`, `delete_all`, and
+  `stream` batch all such non-indexable keys given in one call into a
+  single table scan, instead of scanning once per such key.
 - [Nebulex.Adapters.Local] Duplicate keys given to `{:in, keys}` queries are
   now processed once instead of once per occurrence.
 - [Nebulex.Adapters.Local] `{:in, keys}` queries no longer silently ignore

@@ -289,6 +289,14 @@ defmodule Nebulex.Adapters.Local do
     * `count_all` and `delete_all` neither count nor delete expired entries.
     * `stream` is read-only; it does not move entries across generations nor
       remove expired ones.
+    * Keys that can't be bound in an ETS match head — `:_`, `:"$N"` atoms,
+      maps, structs, or terms containing them — aren't indexable. `get_all`
+      is unaffected, since it looks these up directly. `count_all`,
+      `delete_all`, and `stream` instead match every such key given in one
+      call with a single extra table scan (not one scan per key), so a call
+      that mixes a few of these keys among many ordinary ones stays cheap;
+      a call given only such keys still costs one scan proportional to the
+      cache size.
 
   ## Building Match Specs with QueryHelper
 
@@ -1326,12 +1334,24 @@ defmodule Nebulex.Adapters.Local do
   defp select_keys(meta_tab, backend, keys, select) do
     now = Time.now()
     generations = list_gen(meta_tab)
+    {safe, unsafe} = Enum.split_with(keys, &safe_match_head_key?/1)
 
-    Enum.flat_map(keys, fn key ->
-      ms = key_match_spec(key, select, now)
+    safe_results =
+      Enum.flat_map(safe, fn key ->
+        ms = key_match_spec(key, select, now)
 
-      Enum.flat_map(generations, &backend.select(&1, ms))
-    end)
+        Enum.flat_map(generations, &backend.select(&1, ms))
+      end)
+
+    case unsafe do
+      [] ->
+        safe_results
+
+      _ ->
+        ms = unsafe_keys_match_spec(unsafe, select, now)
+
+        safe_results ++ Enum.flat_map(generations, &backend.select(&1, ms))
+    end
   end
 
   ## Nebulex.Adapter.Info
@@ -1622,15 +1642,31 @@ defmodule Nebulex.Adapters.Local do
   end
 
   defp do_count_all(backend, tab, keys, now) do
-    Enum.reduce(keys, 0, fn key, acc ->
-      backend.select_count(tab, key_match_spec(key, now)) + acc
-    end)
+    {safe, unsafe} = Enum.split_with(keys, &safe_match_head_key?/1)
+
+    count =
+      Enum.reduce(safe, 0, fn key, acc ->
+        backend.select_count(tab, key_match_spec(key, now)) + acc
+      end)
+
+    case unsafe do
+      [] -> count
+      _ -> count + backend.select_count(tab, unsafe_keys_match_spec(unsafe, now))
+    end
   end
 
   defp do_delete_all(backend, tab, keys, now) do
-    Enum.reduce(keys, 0, fn key, acc ->
-      backend.select_delete(tab, key_match_spec(key, now)) + acc
-    end)
+    {safe, unsafe} = Enum.split_with(keys, &safe_match_head_key?/1)
+
+    count =
+      Enum.reduce(safe, 0, fn key, acc ->
+        backend.select_delete(tab, key_match_spec(key, now)) + acc
+      end)
+
+    case unsafe do
+      [] -> count
+      _ -> count + backend.select_delete(tab, unsafe_keys_match_spec(unsafe, now))
+    end
   end
 
   defp return({:ok, entry(value: value)}, :value) do
@@ -1765,6 +1801,37 @@ defmodule Nebulex.Adapters.Local do
         }
       ]
     end
+  end
+
+  # Match spec for a batch of keys that can't be bound in the match head
+  # (see `safe_match_head_key?/1`). All such keys are matched with a single
+  # scan (one `:orelse`-chained guard), instead of one scan per key.
+  defp unsafe_keys_match_spec(keys, now) do
+    [
+      {
+        entry(key: :"$1", value: :_, touched: :_, exp: :"$4", tag: :_),
+        [key_in_guard(keys), not_expired(now)],
+        [true]
+      }
+    ]
+  end
+
+  defp unsafe_keys_match_spec(keys, select, now) do
+    [
+      {
+        entry(key: :"$1", value: :"$2", touched: :_, exp: :"$4", tag: :_),
+        [key_in_guard(keys), not_expired(now)],
+        [match_return(select)]
+      }
+    ]
+  end
+
+  defp key_in_guard([key]) do
+    {:"=:=", :"$1", {:const, key}}
+  end
+
+  defp key_in_guard([key | rest]) do
+    {:orelse, {:"=:=", :"$1", {:const, key}}, key_in_guard(rest)}
   end
 
   defp not_expired(now) do

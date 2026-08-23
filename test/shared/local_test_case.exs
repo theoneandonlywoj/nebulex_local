@@ -454,6 +454,22 @@ defmodule Nebulex.Adapters.LocalTest do
         assert cache.count_all!() == 6
       end
 
+      test "queries with {:in, keys} batch reserved match-spec atoms with ordinary keys", %{
+        cache: cache
+      } do
+        :ok = cache.put_all(%{:a => 1, :b => 2, :"$1" => 3, {:_, :x} => 4, %{a: 1} => 5})
+
+        keys = [:a, :b, :"$1", {:_, :x}, %{a: 1}, :unknown]
+
+        expected = Enum.sort([{:a, 1}, {:b, 2}, {:"$1", 3}, {{:_, :x}, 4}, {%{a: 1}, 5}])
+
+        assert cache.get_all!(in: keys) |> Enum.sort() == expected
+        assert cache.stream!(in: keys) |> Enum.sort() == expected
+        assert cache.count_all!(in: keys) == 5
+        assert cache.delete_all!(in: keys) == 5
+        assert cache.count_all!() == 0
+      end
+
       test "queries with {:in, keys} ignore duplicated keys", %{cache: cache} do
         :ok = cache.put_all(a: 1, b: 2)
 
